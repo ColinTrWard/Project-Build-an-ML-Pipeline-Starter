@@ -1,135 +1,135 @@
-import os
 import argparse
-import pandas as pd
-import wandb
-import joblib
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
+import logging
+import os
 import json
+import pandas as pd
+import tempfile
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+import wandb
 
+logging.basicConfig(level=logging.INFO)
 
 def go(args):
-    # Initialize W&B
-    wandb.init(project="nyc_airbnb", job_type="train_random_forest")
+    """
+    Main function to train a random forest model and upload results to Weights & Biases.
+    """
+    # Start a Weights & Biases run
+    run = wandb.init(
+        project="nyc_airbnb",  # Ensure this matches your W&B project name
+        job_type="train_random_forest",
+        config={
+            "val_size": args.val_size,
+            "random_seed": args.random_seed,
+            "stratify_by": args.stratify_by,
+            "target": args.target,
+            "numerical_features": args.numerical_features,
+            "categorical_features": args.categorical_features,
+            "rf_config_path": args.rf_config,
+            "max_tfidf_features": args.max_tfidf_features,
+            "date_features": args.date_features,
+        },
+    )
 
-    # Log configuration parameters
-    wandb.config.update(vars(args))
-
-    # Retrieve the artifact from W&B
-    print(f"Fetching artifact: {args.trainval_artifact}")
+    logging.info(f"Resolving artifact path for: {args.trainval_artifact}")
     artifact = wandb.use_artifact(args.trainval_artifact)
-
-    # Download the artifact and locate the exact file
     artifact_dir = artifact.download()
-    print(f"Artifact directory: {artifact_dir}")
 
-    # Search for trainval_data.csv in artifact directory and subdirectories
-    file_name = "trainval_data.csv"
-    file_path = None
+    logging.info(f"Downloaded artifact to: {artifact_dir}")
+
+    # Debug: Log the directory structure to identify the correct path
+    logging.info(f"Contents of artifact directory {artifact_dir}:")
+    for root, dirs, files in os.walk(artifact_dir):
+        logging.info(f"Root: {root}, Directories: {dirs}, Files: {files}")
+
+    # Dynamically locate the trainval_data.csv within the artifact directory
+    trainval_data_path = None
     for root, _, files in os.walk(artifact_dir):
-        if file_name in files:
-            file_path = os.path.join(root, file_name)
+        if "trainval_data.csv" in files:
+            trainval_data_path = os.path.join(root, "trainval_data.csv")
             break
 
-    if not file_path:
-        raise FileNotFoundError(
-            f"'{file_name}' not found in artifact directory or subdirectories: {artifact_dir}. "
-            f"Contents: {os.listdir(artifact_dir)}"
-        )
+    if trainval_data_path is None:
+        logging.error(f"trainval_data.csv not found in artifact directory: {artifact_dir}")
+        raise FileNotFoundError(f"trainval_data.csv not found in artifact directory: {artifact_dir}")
 
-    print(f"Successfully located the file: {file_path}")
+    logging.info(f"Loading trainval data from {trainval_data_path}")
+    trainval_data = pd.read_csv(trainval_data_path)
 
-    # Load the data
-    data = pd.read_csv(file_path)
-    print(f"Loaded data with shape: {data.shape}")
-
-    target = args.target
-    features = [col for col in data.columns if col != target]
-
-    X = data[features]
-    y = data[target]
-
-    # Define preprocessing pipeline
-    preprocess = ColumnTransformer(
-        transformers=[
-            ("num", StandardScaler(), args.numerical_features.split(",")),
-            ("cat", OneHotEncoder(handle_unknown="ignore"), args.categorical_features.split(",")),
-            ("date", StandardScaler(), args.date_features.split(",")),
-        ]
-    )
-
-    # Load Random Forest configuration from JSON file
-    with open(args.rf_config, "r") as f:
-        rf_config = json.load(f)
-
-    # Log Random Forest configuration to WandB
-    wandb.config.update(rf_config, allow_val_change=True)
-
-    rf_model = RandomForestRegressor(
-        max_depth=rf_config["max_depth"],
-        n_estimators=rf_config["n_estimators"],
+    # Splitting the dataset
+    logging.info("Splitting the dataset...")
+    stratify_col = trainval_data[args.stratify_by] if args.stratify_by else None
+    train_df, val_df = train_test_split(
+        trainval_data,
+        test_size=args.val_size,
         random_state=args.random_seed,
+        stratify=stratify_col,
     )
 
-    # Log the max TF-IDF features parameter
-    wandb.log({"max_tfidf_features": args.max_tfidf_features})
+    logging.info(f"Train size: {train_df.shape}, Validation size: {val_df.shape}")
 
-    # Build pipeline
-    sk_pipe = Pipeline([("preprocess", preprocess), ("model", rf_model)])
+    # Prepare the Random Forest configuration
+    logging.info(f"Loading Random Forest configuration from: {args.rf_config}")
+    with open(args.rf_config, "r") as rf_file:
+        rf_config = json.load(rf_file)
 
-    # Split the dataset
-    print(f"Splitting data with validation size: {args.val_size}")
-    stratify = data[args.stratify_by] if args.stratify_by != "none" else None
+    logging.info(f"Loaded Random Forest Configuration: {rf_config}")
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=args.val_size, random_state=args.random_seed, stratify=stratify
-    )
+    # Features and target
+    X_train = train_df[args.numerical_features + args.categorical_features]
+    y_train = train_df[args.target]
 
-    # Train and evaluate the model
-    print("Training the Random Forest model...")
-    sk_pipe.fit(X_train, y_train)
-    y_pred = sk_pipe.predict(X_val)
+    X_val = val_df[args.numerical_features + args.categorical_features]
+    y_val = val_df[args.target]
 
-    mae = mean_absolute_error(y_val, y_pred)
-    mse = mean_squared_error(y_val, y_pred)
-    r2 = r2_score(y_val, y_pred)
+    # Train the model
+    logging.info("Training the Random Forest model...")
+    model = RandomForestRegressor(**rf_config)
+    model.fit(X_train, y_train)
 
-    # Log metrics to WandB
-    wandb.log({"mae": mae, "mse": mse, "r2": r2})
+    logging.info("Model training complete.")
 
-    # Save and log the model artifact
-    model_path = f"{args.output_artifact}.joblib"
-    print(f"Saving the model to {model_path}...")
-    joblib.dump(sk_pipe, model_path)
+    # Evaluate the model
+    train_score = model.score(X_train, y_train)
+    val_score = model.score(X_val, y_val)
+    logging.info(f"Train R^2 score: {train_score}")
+    logging.info(f"Validation R^2 score: {val_score}")
 
-    artifact = wandb.Artifact(
-        args.output_artifact, type="model", description="Random Forest model pipeline"
-    )
-    artifact.add_file(model_path)
-    wandb.log_artifact(artifact)
+    # Log metrics to Weights & Biases
+    wandb.log({"train_score": train_score, "val_score": val_score})
 
-    # Finish WandB run
-    wandb.finish()
+    # Log the model and validation performance to W&B
+    with tempfile.TemporaryDirectory() as temp_dir:
+        model_path = os.path.join(temp_dir, "random_forest_model.pkl")
+        pd.to_pickle(model, model_path)
+
+        logging.info("Uploading the trained model to W&B...")
+        artifact = wandb.Artifact(
+            args.output_artifact,
+            type="model_export",
+            description="Random Forest Model Export",
+        )
+        artifact.add_file(model_path)
+        run.log_artifact(artifact)
+
+    logging.info("Training pipeline complete.")
+    run.finish()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a Random Forest model")
-    parser.add_argument("--trainval_artifact", type=str, required=True)
-    parser.add_argument("--target", type=str, required=True)
-    parser.add_argument("--val_size", type=float, default=0.2)
-    parser.add_argument("--random_seed", type=int, default=42)
-    parser.add_argument("--numerical_features", type=str, required=True)
-    parser.add_argument("--categorical_features", type=str, required=True)
-    parser.add_argument("--date_features", type=str, required=True)
-    parser.add_argument("--rf_config", type=str, required=True)
-    parser.add_argument("--output_artifact", type=str, required=True)
-    parser.add_argument("--max_tfidf_features", type=int, required=True, help="Maximum number of TF-IDF features to use")
-    parser.add_argument(
-        "--stratify_by", type=str, default="none", help="Column name for stratification during train-test split"
-    )
+    parser = argparse.ArgumentParser(description="Train a Random Forest model.")
+    parser.add_argument("--trainval_artifact", type=str, required=True, help="Train/validation artifact name")
+    parser.add_argument("--val_size", type=float, default=0.2, help="Validation set size")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--stratify_by", type=str, default=None, help="Column to stratify by")
+    parser.add_argument("--target", type=str, required=True, help="Target column for prediction")
+    parser.add_argument("--numerical_features", type=str, nargs="+", required=True, help="Numerical feature columns")
+    parser.add_argument("--categorical_features", type=str, nargs="+", required=True, help="Categorical feature columns")
+    parser.add_argument("--rf_config", type=str, required=True, help="Random Forest configuration file")
+    parser.add_argument("--output_artifact", type=str, required=True, help="Output artifact name")
+    parser.add_argument("--max_tfidf_features", type=int, help="Max TF-IDF features")
+    parser.add_argument("--date_features", type=str, nargs="+", help="Date feature columns")
+
     args = parser.parse_args()
+
     go(args)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-This script splits the provided dataframe in test and remainder
+This script splits the provided dataframe into test and remainder datasets
 """
 import argparse
 import logging
@@ -15,58 +15,46 @@ logger = logging.getLogger()
 
 
 def go(args):
-
     run = wandb.init(job_type="train_val_test_split")
-    run.config.update(args)
+    run.config.update(vars(args))  # Log arguments to W&B
 
-    # Download input artifact. This will also note that this script is using this
-    # particular version of the artifact
-    logger.info(f"Fetching artifact {args.input}")
-    artifact_local_path = run.use_artifact(args.input).file()
+    logger.info(f"Fetching artifact {args.input_artifact}")
+    artifact = run.use_artifact(args.input_artifact)
+    artifact_path = artifact.file()
 
-    df = pd.read_csv(artifact_local_path)
+    df = pd.read_csv(artifact_path)
 
-    logger.info("Splitting trainval and test")
+    logger.info("Splitting trainval and test datasets")
+    stratify_column = df[args.stratify_by] if args.stratify_by != "none" else None
+
     trainval, test = train_test_split(
         df,
         test_size=args.test_size,
         random_state=args.random_seed,
-        stratify=df[args.stratify_by] if args.stratify_by != 'none' else None,
+        stratify=stratify_column,
     )
 
-    # Save to output files
-    for df, k in zip([trainval, test], ['trainval', 'test']):
-        logger.info(f"Uploading {k}_data.csv dataset")
-        with tempfile.NamedTemporaryFile("w") as fp:
-
-            df.to_csv(fp.name, index=False)
+    for dataset, split_name in zip([trainval, test], ["trainval", "test"]):
+        logger.info(f"Uploading {split_name}_data.csv dataset")
+        with tempfile.NamedTemporaryFile("w", delete=False) as fp:
+            dataset.to_csv(fp.name, index=False)
 
             log_artifact(
-                f"{k}_data.csv",
-                f"{k}_data",
-                f"{k} split of dataset",
-                fp.name,
-                run,
+                artifact_name=f"{split_name}_data.csv",
+                artifact_type=f"{split_name}_data",
+                artifact_description=f"{split_name} split of the dataset",
+                file_path=fp.name,
+                run=run,
             )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Split test and remainder")
+    parser = argparse.ArgumentParser(description="Split test and remainder datasets")
 
-    parser.add_argument("input", type=str, help="Input artifact to split")
-
-    parser.add_argument(
-        "test_size", type=float, help="Size of the test split. Fraction of the dataset, or number of items"
-    )
-
-    parser.add_argument(
-        "--random_seed", type=int, help="Seed for random number generator", default=42, required=False
-    )
-
-    parser.add_argument(
-        "--stratify_by", type=str, help="Column to use for stratification", default='none', required=False
-    )
+    parser.add_argument("--input_artifact", type=str, required=True, help="Input artifact to split (CSV file)")
+    parser.add_argument("--test_size", type=float, required=True, help="Fraction of data for test split")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--stratify_by", type=str, default="none", help="Column for stratification (optional)")
 
     args = parser.parse_args()
-
     go(args)

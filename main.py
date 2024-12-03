@@ -67,10 +67,10 @@ def go(config: DictConfig):
 
         if "data_split" in active_steps:
             mlflow.run(
-                to_absolute_path("src/data_split"),
+                f"{config['main']['components_repository']}/train_val_test_split",
                 "main",
                 parameters={
-                    "input_artifact": "clean_sample.csv:latest",
+                    "input": config["etl"]["input_artifact"],
                     "test_size": config["modeling"]["test_size"],
                     "random_seed": config["modeling"]["random_seed"],
                     "stratify_by": config["modeling"].get("stratify_by", "none"),
