@@ -7,8 +7,57 @@ import tempfile
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 import wandb
+import shutil
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 logging.basicConfig(level=logging.INFO)
+
+
+def process_artifact(artifact_dir):
+    """
+    Process files in the artifact directory based on their type.
+    Returns the path to the trainval_data.csv file after processing.
+    """
+    trainval_data_path = None
+    for root, _, files in os.walk(artifact_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+
+            if file.endswith('.csv'):
+                logging.info(f"CSV file detected: {file_path}")
+                trainval_data_path = file_path
+            elif file.endswith('.zip'):
+                logging.info(f"ZIP file detected: {file_path}. Extracting...")
+                shutil.unpack_archive(file_path, artifact_dir)
+            elif file.endswith('.json'):
+                logging.info(f"JSON file detected: {file_path}. Converting to CSV...")
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                df = pd.DataFrame(data)
+                trainval_data_path = os.path.join(artifact_dir, 'trainval_data.csv')
+                df.to_csv(trainval_data_path, index=False)
+                logging.info(f"Converted JSON to CSV: {trainval_data_path}")
+            elif file.endswith('.txt'):
+                logging.info(f"Text file detected: {file_path}. Processing as plain text...")
+                # Attempting to read with utf-8 encoding to handle various characters
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    # Here, you can convert plain text to a pandas dataframe or save it to a CSV if needed
+                    trainval_data_path = os.path.join(artifact_dir, 'trainval_data.csv')
+                    with open(trainval_data_path, 'w', encoding='utf-8') as f:
+                        f.write(content)  # Saving the plain text as CSV (if that's what you need)
+                    logging.info(f"Text file content saved as CSV: {trainval_data_path}")
+                except UnicodeDecodeError as e:
+                    logging.error(f"Failed to read {file_path} due to encoding issues: {e}")
+                    raise
+    if not trainval_data_path:
+        raise FileNotFoundError("No compatible data file (CSV, ZIP, JSON, or TXT) found in the artifact.")
+
+    return trainval_data_path
+
 
 def go(args):
     """
@@ -32,29 +81,15 @@ def go(args):
     )
 
     logging.info(f"Resolving artifact path for: {args.trainval_artifact}")
-    artifact = wandb.use_artifact(args.trainval_artifact)
+    artifact = run.use_artifact(args.trainval_artifact)
     artifact_dir = artifact.download()
 
     logging.info(f"Downloaded artifact to: {artifact_dir}")
-
-    # Debug: Log the directory structure to identify the correct path
-    logging.info(f"Contents of artifact directory {artifact_dir}:")
-    for root, dirs, files in os.walk(artifact_dir):
-        logging.info(f"Root: {root}, Directories: {dirs}, Files: {files}")
-
-    # Dynamically locate the trainval_data.csv within the artifact directory
-    trainval_data_path = None
-    for root, _, files in os.walk(artifact_dir):
-        if "trainval_data.csv" in files:
-            trainval_data_path = os.path.join(root, "trainval_data.csv")
-            break
-
-    if trainval_data_path is None:
-        logging.error(f"trainval_data.csv not found in artifact directory: {artifact_dir}")
-        raise FileNotFoundError(f"trainval_data.csv not found in artifact directory: {artifact_dir}")
+    trainval_data_path = process_artifact(artifact_dir)
 
     logging.info(f"Loading trainval data from {trainval_data_path}")
     trainval_data = pd.read_csv(trainval_data_path)
+    logging.info(f"Loaded trainval data with shape: {trainval_data.shape}")
 
     # Splitting the dataset
     logging.info("Splitting the dataset...")
@@ -76,18 +111,37 @@ def go(args):
     logging.info(f"Loaded Random Forest Configuration: {rf_config}")
 
     # Features and target
-    X_train = train_df[args.numerical_features + args.categorical_features]
+    numerical_features = args.numerical_features
+    categorical_features = args.categorical_features
+
+    X_train = train_df[numerical_features + categorical_features]
     y_train = train_df[args.target]
 
-    X_val = val_df[args.numerical_features + args.categorical_features]
+    X_val = val_df[numerical_features + categorical_features]
     y_val = val_df[args.target]
 
-    # Train the model
-    logging.info("Training the Random Forest model...")
-    model = RandomForestRegressor(**rf_config)
-    model.fit(X_train, y_train)
+    # Preprocessing for numerical and categorical features
+    numerical_transformer = StandardScaler()
+    categorical_transformer = OneHotEncoder(handle_unknown="ignore")
 
-    logging.info("Model training complete.")
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numerical_transformer, numerical_features),
+            ("cat", categorical_transformer, categorical_features),
+        ]
+    )
+
+    # Build the pipeline
+    model = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("regressor", RandomForestRegressor(**rf_config)),
+        ]
+    )
+
+    # Train the model
+    logging.info("Training the Random Forest model with preprocessing...")
+    model.fit(X_train, y_train)
 
     # Evaluate the model
     train_score = model.score(X_train, y_train)
@@ -124,7 +178,8 @@ if __name__ == "__main__":
     parser.add_argument("--stratify_by", type=str, default=None, help="Column to stratify by")
     parser.add_argument("--target", type=str, required=True, help="Target column for prediction")
     parser.add_argument("--numerical_features", type=str, nargs="+", required=True, help="Numerical feature columns")
-    parser.add_argument("--categorical_features", type=str, nargs="+", required=True, help="Categorical feature columns")
+    parser.add_argument("--categorical_features", type=str, nargs="+", required=True,
+                        help="Categorical feature columns")
     parser.add_argument("--rf_config", type=str, required=True, help="Random Forest configuration file")
     parser.add_argument("--output_artifact", type=str, required=True, help="Output artifact name")
     parser.add_argument("--max_tfidf_features", type=int, help="Max TF-IDF features")
