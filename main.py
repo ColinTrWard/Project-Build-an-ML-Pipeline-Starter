@@ -109,7 +109,7 @@ def go(config: DictConfig):
                 to_absolute_path("components/test_regression_model"),
                 "main",
                 parameters={
-                    "mlflow_model": "random_forest_export:prod",
+                    "mlflow_model": "random_forest_model:prod",
                     "test_dataset": "test_data.csv:latest",
                 },
             )
@@ -117,4 +117,3 @@ def go(config: DictConfig):
 
 if __name__ == "__main__":
     go()
-
